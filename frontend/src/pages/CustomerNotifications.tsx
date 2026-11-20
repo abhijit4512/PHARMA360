@@ -1,0 +1,33 @@
+import {useEffect,useMemo,useState} from 'react';
+import {api} from '../lib/api';
+import {Link} from 'react-router-dom';
+import {Bell,ArrowLeft,Mail,MessageSquare,Smartphone,Package,Tag,CheckCheck,RefreshCw,Settings2,Inbox,CheckCircle2} from 'lucide-react';
+type Prefs={email_enabled:boolean;sms_enabled:boolean;whatsapp_enabled:boolean;order_updates:boolean;offers_enabled:boolean};
+type Notification={id:number;order_id:number|null;title:string;message:string;channel:string;delivery_status:string;is_read:boolean;created_at:string};
+const defaults:Prefs={email_enabled:true,sms_enabled:false,whatsapp_enabled:false,order_updates:true,offers_enabled:false};
+const channelIcon=(c:string)=>c==='email'?Mail:c==='sms'?Smartphone:c==='whatsapp'?MessageSquare:Bell;
+const nice=(s:string)=>s.replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
+export default function CustomerNotifications(){
+ const [prefs,setPrefs]=useState(defaults);const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [message,setMessage]=useState('');
+ const [notifications,setNotifications]=useState<Notification[]>([]);const [filter,setFilter]=useState<'all'|'unread'>('all');const [busyId,setBusyId]=useState<number|null>(null);
+ useEffect(()=>{api.get('/notifications/preferences').then(r=>setPrefs(r.data)).catch(()=>setMessage('Please sign in with a customer account to manage preferences.')).finally(()=>setLoading(false));loadNotifications();const timer=window.setInterval(loadNotifications,15000);return()=>window.clearInterval(timer)},[]);
+ async function loadNotifications(){try{const r=await api.get('/notifications');setNotifications(r.data||[])}catch{}}
+ async function markRead(id:number){setBusyId(id);try{await api.patch(`/notifications/${id}/read`);setNotifications(prev=>prev.map(n=>n.id===id?{...n,is_read:true}:n))}catch{setMessage('Could not mark notification as read.')}finally{setBusyId(null)}}
+ async function markAllRead(){const unread=notifications.filter(n=>!n.is_read);for(const n of unread){try{await api.patch(`/notifications/${n.id}/read`)}catch{}}await loadNotifications()}
+ async function save(){setSaving(true);setMessage('');try{await api.put('/notifications/preferences',prefs);setMessage('Your notification preferences have been saved.')}catch(e:any){setMessage(e.response?.data?.detail||'Could not save settings.')}finally{setSaving(false)}}
+ const rows:[keyof Prefs,string,string,any][]=[['email_enabled','Email notifications','Order and account messages delivered to your email.',Mail],['sms_enabled','SMS notifications','Text alerts when a phone number and SMS provider are configured.',Smartphone],['whatsapp_enabled','WhatsApp notifications','WhatsApp alerts with customer opt-in and Business API setup.',MessageSquare],['order_updates','Order status updates','Receive order received, accepted, packed, dispatched, delivery and cancellation updates.',Package],['offers_enabled','Offers and promotions','Optional product offers and promotional messages.',Tag]];
+ const unread=notifications.filter(n=>!n.is_read).length;const shown=filter==='unread'?notifications.filter(n=>!n.is_read):notifications;
+ return <main className="customer-notifications-page"><div className="cn-shell">
+  <Link to="/shop" className="cn-back"><ArrowLeft size={16}/> Back to shop</Link>
+  <header className="cn-hero"><div className="cn-hero-icon"><Bell size={23}/></div><div><div className="eyebrow">ACCOUNT CENTER</div><h1>Notifications</h1><p>All your PHARMA360 updates in one place. Order changes are shown here and sent using your enabled contact channels.</p></div><div className="cn-unread-count"><b>{unread}</b><span>unread</span></div></header>
+  <section className="cn-section"><div className="cn-section-heading"><div><span className="cn-section-kicker">YOUR ACTIVITY</span><h2>Notification inbox</h2><p>Live updates refresh automatically. Open or mark items as read anytime.</p></div><div className="cn-actions"><button className="cn-secondary" onClick={loadNotifications}><RefreshCw size={14}/> Refresh</button>{unread>0&&<button className="cn-primary-small" onClick={markAllRead}><CheckCheck size={14}/> Mark all read</button>}</div></div>
+  <div className="cn-filterbar"><button className={filter==='all'?'active':''} onClick={()=>setFilter('all')}>All notifications <span>{notifications.length}</span></button><button className={filter==='unread'?'active':''} onClick={()=>setFilter('unread')}>Unread <span>{unread}</span></button></div>
+  <div className="cn-notification-list">{shown.map(n=>{const Icon=channelIcon(n.channel);return <article className={`cn-notification ${n.is_read?'read':'unread'}`} key={n.id}><div className={`cn-notice-icon ${n.channel}`}><Icon size={17}/></div><div className="cn-notice-content"><div className="cn-notice-top"><h3>{n.title}</h3><span className={`cn-channel ${n.channel}`}>{nice(n.channel)}</span>{!n.is_read&&<span className="cn-unread-dot"/>}</div><p>{n.message}</p><div className="cn-notice-meta"><span>{new Date(n.created_at).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short'})}</span><span className={`cn-delivery-status ${n.delivery_status}`}>{nice(n.delivery_status)}</span>{n.order_id&&<span>Order #{n.order_id}</span>}</div></div>{!n.is_read&&<button className="cn-mark-read" disabled={busyId===n.id} onClick={()=>markRead(n.id)} title="Mark as read"><CheckCircle2 size={16}/></button>}</article>})}{!shown.length&&<div className="cn-empty"><div><Inbox size={25}/></div><b>{filter==='unread'?'You’re all caught up':'No notifications yet'}</b><p>Order and account updates will appear here automatically.</p></div>}</div>
+ </section>
+ <section className="cn-section cn-preferences"><div className="cn-section-heading"><div><span className="cn-section-kicker">CONTACT CHANNELS</span><h2>Notification preferences</h2><p>Choose where customer notifications are sent. In-app notifications remain available in your inbox.</p></div><div className="cn-settings-icon"><Settings2 size={18}/></div></div>
+ {loading?<div className="cn-loading">Loading preferences…</div>:rows.map(([key,title,desc,Icon])=><label className="cn-setting-row" key={key}><div className="cn-setting-icon"><Icon size={17}/></div><div className="cn-setting-copy"><b>{title}</b><p>{desc}</p></div><input type="checkbox" checked={prefs[key]} onChange={e=>setPrefs({...prefs,[key]:e.target.checked})}/></label>)}
+ {message&&<div className="cn-message">{message}</div>}<button className="cn-save" onClick={save} disabled={loading||saving}>{saving?'Saving preferences…':'Save notification preferences'}</button>
+ </section>
+ <footer className="cn-footer"><Bell size={14}/> PHARMA360 notifications · Customer inbox</footer>
+ </div></main>
+}
