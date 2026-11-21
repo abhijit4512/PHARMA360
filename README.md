@@ -157,3 +157,8 @@ This seed operation is idempotent for its demo batches and does not reset the da
 - Frontend build command: `cd frontend && npm ci && npm run build` (requires a complete npm installation).
 
 See `docs/IMPLEMENTATION_STATUS.md` for the current verification results and known limitations.
+
+inventory login:
+Login URL: http://localhost:5173/inventory/login
+banjarahillsinventory@gmail.com 
+password:banjarahills@12345

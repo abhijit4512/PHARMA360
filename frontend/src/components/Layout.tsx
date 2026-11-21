@@ -37,7 +37,7 @@ export default function Layout() {
         </div>
         <div className="workspace-label">WORKSPACE</div>
         <nav>
-          {links.filter(([label]) => user?.role==='super_admin' || label!=='Pharmacy Stores').map(([label, path, Icon]) => (
+          {links.filter(([label]) => user?.role==='inventory_manager' ? label==='Inventory' : (user?.role==='super_admin' || label!=='Pharmacy Stores')).map(([label, path, Icon]) => (
             <NavLink key={path} to={path} onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
               <Icon size={18}/><span>{label}</span>{label === 'Orders' && <i className="nav-dot"/>}
             </NavLink>

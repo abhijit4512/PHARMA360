@@ -1,11 +1,13 @@
 from datetime import datetime, timedelta, date
 from uuid import uuid4
 import os
+import csv
+import io
 import logging
 from app.services.notifications import send_twilio, send_email
 
 logger = logging.getLogger("pharma360.orders")
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.core.database import get_db
@@ -197,6 +199,153 @@ def update_store_status(store_id:int, status:str, db:Session=Depends(get_db), us
     if status not in ['active','inactive']: raise HTTPException(400,'Invalid status')
     store.status=status
     db.commit(); return {"id":store.id,"status":store.status}
+
+
+
+def _read_csv_upload(file: UploadFile):
+    raw = file.file.read()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw.decode('latin-1')
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(400, 'CSV file has no header row')
+    return reader
+
+def _csv_value(row, key, default=''):
+    value = row.get(key, default)
+    return str(value).strip() if value is not None else default
+
+def _csv_float(value, default=0.0):
+    try:
+        cleaned = str(value or '').replace(',', '').replace('₹', '').strip()
+        return float(cleaned) if cleaned else default
+    except (TypeError, ValueError):
+        return default
+
+def _csv_bool(value):
+    return str(value or '').strip().lower() in {'yes','y','true','1','required'}
+
+@router.post('/inventory/import/products')
+def import_products_csv(file: UploadFile = File(...), replace_existing: bool = Form(False), db: Session = Depends(get_db), user: User = Depends(require_roles('super_admin','pharmacy_owner','pharmacy_manager','inventory_manager'))):
+    if not file.filename or not file.filename.lower().endswith('.csv'):
+        raise HTTPException(400, 'Please upload a CSV file')
+    reader = _read_csv_upload(file)
+    product_rows = list(reader)
+    created = updated = skipped = 0
+    errors = []
+    deactivated = 0
+    if replace_existing:
+        if not product_rows or any(not _csv_value(row, 'SKU') or not _csv_value(row, 'Generic_Name') for row in product_rows):
+            raise HTTPException(400, 'Replace catalog was not started: CSV must contain rows with SKU and Generic_Name')
+        deactivated = db.query(Product).filter(Product.is_active.is_(True)).update({Product.is_active: False}, synchronize_session=False)
+    for line, row in enumerate(product_rows, start=2):
+        sku = _csv_value(row, 'SKU')
+        generic = _csv_value(row, 'Generic_Name')
+        strength = _csv_value(row, 'Strength')
+        dosage = _csv_value(row, 'Dosage_Form')
+        brand = _csv_value(row, 'Brand_Name')
+        category = _csv_value(row, 'Category', 'Other') or 'Other'
+        if not sku or not generic:
+            skipped += 1
+            if len(errors) < 25: errors.append(f'Row {line}: missing SKU or Generic_Name')
+            continue
+        brand_is_placeholder = not brand or 'generic / unbranded' in brand.lower() or 'verify' in brand.lower()
+        name = (generic + (f' {strength}' if strength else '') + (f' {dosage}' if dosage else '')).strip() if brand_is_placeholder else brand
+        mrp = _csv_float(_csv_value(row, 'MRP_INR'))
+        selling = _csv_float(_csv_value(row, 'Selling_Price_INR_DEMO'), mrp)
+        desc_parts = [f"Generic: {generic}"]
+        for label, col in [('Salt composition','Salt_Composition'),('Strength','Strength'),('Dosage form','Dosage_Form'),('Pack size','Pack_Size'),('Manufacturer','Manufacturer'),('Storage','Storage_Conditions')]:
+            val = _csv_value(row, col)
+            if val: desc_parts.append(f'{label}: {val}')
+        try:
+            p = db.query(Product).filter(Product.sku == sku).first()
+            values = dict(name=name[:220], generic_name=generic[:220], brand=brand[:120], category=category[:100], description='; '.join(desc_parts), mrp=max(0,mrp), selling_price=max(0,selling), prescription_required=_csv_bool(_csv_value(row,'Prescription_Required')), image_url='')
+            if p:
+                for k,v in values.items(): setattr(p,k,v)
+                p.is_active = True
+                updated += 1
+            else:
+                db.add(Product(sku=sku[:80], **values))
+                created += 1
+        except Exception as exc:
+            skipped += 1
+            if len(errors) < 25: errors.append(f'Row {line} ({sku}): {str(exc)[:160]}')
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(400, f'Product CSV import failed; transaction rolled back: {str(exc)[:250]}')
+    return {'created':created,'updated':updated,'skipped':skipped,'deactivated':deactivated,'errors':errors,'message':f'Product import complete: {created} created, {updated} updated, {skipped} skipped, {deactivated} previous products deactivated.' if replace_existing else f'Product import complete: {created} created, {updated} updated, {skipped} skipped.'}
+
+@router.post('/inventory/import/batches')
+def import_batches_csv(file: UploadFile = File(...), pharmacy_id: int | None = Form(None), replace_existing: bool = Form(False), db: Session = Depends(get_db), user: User = Depends(require_roles('super_admin','pharmacy_owner','pharmacy_manager','inventory_manager'))):
+    if not file.filename or not file.filename.lower().endswith('.csv'):
+        raise HTTPException(400, 'Please upload a CSV file')
+    target_pharmacy = pharmacy_id if user.role == 'super_admin' else user.pharmacy_id
+    if not target_pharmacy:
+        raise HTTPException(400, 'Choose a pharmacy/store for this inventory import')
+    if not db.get(Pharmacy, target_pharmacy):
+        raise HTTPException(404, 'Pharmacy/store not found')
+    reader = _read_csv_upload(file)
+    batch_rows = list(reader)
+    created = updated = skipped = 0
+    errors = []
+    removed = 0
+    if replace_existing:
+        validation_errors=[]
+        for line, row in enumerate(batch_rows, start=2):
+            sku=_csv_value(row, 'SKU'); batch_number=_csv_value(row, 'Batch_Number')
+            if not sku or not batch_number:
+                validation_errors.append(f'Row {line}: missing SKU or Batch_Number')
+            elif not db.query(Product).filter(Product.sku==sku).first():
+                validation_errors.append(f'Row {line}: SKU {sku} not found; import products first')
+            expiry_raw=_csv_value(row, 'Expiry_Date_DEMO')
+            if expiry_raw:
+                try: date.fromisoformat(expiry_raw[:10])
+                except ValueError: validation_errors.append(f'Row {line}: invalid Expiry_Date_DEMO')
+            if len(validation_errors)>=25: break
+        if validation_errors:
+            raise HTTPException(400, 'Replace inventory was not started: ' + '; '.join(validation_errors))
+        # Explicit replacement removes only stock batches for the selected pharmacy; other stores are untouched.
+        removed = db.query(InventoryBatch).filter(InventoryBatch.pharmacy_id == target_pharmacy).delete(synchronize_session=False)
+    for line, row in enumerate(batch_rows, start=2):
+        sku = _csv_value(row, 'SKU')
+        batch_number = _csv_value(row, 'Batch_Number')
+        if not sku or not batch_number:
+            skipped += 1
+            if len(errors) < 25: errors.append(f'Row {line}: missing SKU or Batch_Number')
+            continue
+        product = db.query(Product).filter(Product.sku == sku).first()
+        if not product:
+            skipped += 1
+            if len(errors) < 25: errors.append(f'Row {line}: SKU {sku} not found; import product master first')
+            continue
+        try:
+            qty = int(_csv_float(_csv_value(row, 'Current_Stock_DEMO')))
+            purchase_price = _csv_float(_csv_value(row, 'Purchase_Price_INR_DEMO'))
+            expiry_raw = _csv_value(row, 'Expiry_Date_DEMO')
+            expiry = date.fromisoformat(expiry_raw[:10]) if expiry_raw else None
+            existing = db.query(InventoryBatch).filter_by(pharmacy_id=target_pharmacy, product_id=product.id, batch_number=batch_number).first()
+            if existing:
+                # CSV stock is treated as the current/authoritative quantity; re-import won't double stock.
+                existing.quantity = max(0, qty)
+                existing.purchase_price = max(0, purchase_price)
+                existing.expiry_date = expiry
+                updated += 1
+            else:
+                db.add(InventoryBatch(pharmacy_id=target_pharmacy, product_id=product.id, batch_number=batch_number[:100], quantity=max(0,qty), purchase_price=max(0,purchase_price), expiry_date=expiry))
+                created += 1
+        except Exception as exc:
+            skipped += 1
+            if len(errors) < 25: errors.append(f'Row {line} ({sku}/{batch_number}): {str(exc)[:160]}')
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(400, f'Batch CSV import failed; transaction rolled back: {str(exc)[:250]}')
+    return {'created':created,'updated':updated,'skipped':skipped,'removed':removed,'errors':errors,'pharmacy_id':target_pharmacy,'message':f'Batch import complete: {created} created, {updated} updated, {skipped} skipped, {removed} previous batches removed.' if replace_existing else f'Batch import complete: {created} created, {updated} updated, {skipped} skipped.'}
 
 @router.get('/products')
 def products(db:Session=Depends(get_db), user:User=Depends(get_current_user)):
